@@ -64,7 +64,8 @@ from env: `RELAY_UPSTREAM_URL` (default `http://127.0.0.1:8318/v1`) and
 
 - `upstreams`: list of `name`, `base_url`, `api_key_env` (env var holding
   the key, optional), `models` (for `/v1/models` aggregation), `weight`
-  (reserved, must be >= 0), `timeout_s` (per-request, must be > 0).
+  (primary pick share, must be >= 0, default 1), `timeout_s` (per-request,
+  must be > 0).
 - `routes`: ordered list of `match` + `try`. Match is exact (`gpt-4o`),
   prefix (`gpt-*`), or catch-all (`*`). First matching route wins; its
   `try` list is the ordered fallback chain.
@@ -79,10 +80,13 @@ printing PASS/FAIL per upstream.
 
 ## fallbacks and circuit breakers
 
-Upstreams are tried in route order. On 429, 5xx, timeouts, or connection
-errors, relay records the failure, waits a short jittered backoff, and
-tries the next upstream. Other 4xx responses are forwarded to the client
-as-is with no retry.
+When upstream weights differ, the primary is picked by smooth weighted
+round robin, so weights 3 and 1 send about 3/4 of first tries to the
+heavier upstream. The rest stay in route order as the fallback chain, and
+a weight of 0 means fallback only. Equal weights keep plain route order.
+On 429, 5xx, timeouts, or connection errors, relay records the failure,
+waits a short jittered backoff, and tries the next upstream. Other 4xx
+responses are forwarded to the client as-is with no retry.
 
 Each upstream has a circuit breaker: 3 consecutive failures trip it, and
 tripped upstreams are skipped while a healthy one exists. After 30s a
@@ -151,7 +155,7 @@ The server always binds 127.0.0.1.
 - `keys.py` - key issuance/verification, daily spend caps
 - `log.py` - JSONL request log with rotation
 - `dashboard.py` - the dashboard HTML
-- `test_relay.py` - 87 checks, run with `python3 test_relay.py`
+- `test_relay.py` - 96 checks, run with `python3 test_relay.py`
 
 Tests run entirely against fake upstream servers on 127.0.0.1: route
 matching, fallback on 500/429/connection-refused, streaming byte
