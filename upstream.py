@@ -99,6 +99,7 @@ class UpstreamState:
             return {
                 "name": self.name,
                 "base_url": self.base_url,
+                "weight": self.weight,
                 "models": list(self.models),
                 "breaker": self.breaker_state(),
                 "consecutive_failures": self.consecutive_failures,
