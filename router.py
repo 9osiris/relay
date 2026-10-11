@@ -20,6 +20,37 @@ def resolve_route(routes, model):
     return []
 
 
+def pick_weighted(names, weights, current):
+    # smooth weighted round robin pick, current is a mutable dict
+    # weight 0 never wins while any weight is positive
+    total = float(sum(weights))
+    if total <= 0 or not names:
+        return None
+    best = None
+    best_val = None
+    for name, w in zip(names, weights):
+        current[name] = current.get(name, 0.0) + float(w)
+        if best_val is None or current[name] > best_val:
+            best = name
+            best_val = current[name]
+    current[best] -= total
+    return best
+
+
+def weighted_order(names, weights, current):
+    # primary picked by weight, the rest keep route order for fallback
+    # equal weights keep route order so fallback stays predictable
+    ordered = list(names)
+    if len(ordered) <= 1:
+        return ordered
+    if all(float(w) == float(weights[0]) for w in weights):
+        return ordered
+    primary = pick_weighted(ordered, weights, current)
+    if primary is None:
+        return ordered
+    return [primary] + [n for n in ordered if n != primary]
+
+
 def price_for(pricing, model):
     # first matching pricing entry wins, default is zero rates
     for entry in pricing or []:
