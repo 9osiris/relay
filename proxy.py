@@ -15,7 +15,7 @@ import router
 import upstream as upstream_mod
 from dashboard import DASHBOARD_HTML
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 RETRYABLE_STATUSES = (429, 500, 502, 503, 504)
 
 
@@ -95,6 +95,7 @@ class RelayState:
             self.routes = cfg["routes"]
             self.pricing = cfg.get("pricing", [])
             self.by_name = {u.name: u for u in self.upstreams}
+            self._wrr_current = {}
 
     def reload(self):
         # re-read relay.json from disk without restarting
@@ -107,6 +108,17 @@ class RelayState:
     def ordered_upstreams(self, names):
         with self.lock:
             return [self.by_name[n] for n in names if n in self.by_name]
+
+    def order_candidates(self, candidates):
+        # pick the primary by weight, keep the rest in route order
+        if len(candidates) <= 1:
+            return list(candidates)
+        names = [u.name for u in candidates]
+        weights = [float(u.weight or 0) for u in candidates]
+        with self.lock:
+            ordered_names = router.weighted_order(names, weights, self._wrr_current)
+        by_name = {u.name: u for u in candidates}
+        return [by_name[n] for n in ordered_names]
 
     def record_served(self, cost):
         with self.lock:
@@ -269,6 +281,7 @@ def make_handler(state, logger):
             # skip tripped breakers unless every upstream is tripped
             now = time.monotonic()
             candidates = [u for u in ordered if u.breaker_allows(now)] or ordered
+            candidates = state.order_candidates(candidates)
             stream = kind == "chat" and bool(body.get("stream"))
             started = time.monotonic()
             fallbacks = 0
