@@ -2,6 +2,8 @@
 # relay tests: 60+ checks against fake upstreams on 127.0.0.1.
 # run with: python3 test_relay.py
 
+import datetime
+import email.utils
 import http.client
 import json
 import os
@@ -66,9 +68,18 @@ class FakeUpstream:
                         }
                     )
                     n = len(outer.requests)
-                status, payload, ctype = outer.handler_fn(n, body, self.path)
+                # handler fns return (status, payload, ctype) or the same
+                # plus a dict of extra response headers
+                result = outer.handler_fn(n, body, self.path)
+                if len(result) == 4:
+                    status, payload, ctype, extra = result
+                else:
+                    status, payload, ctype = result
+                    extra = {}
                 self.send_response(status)
                 self.send_header("Content-Type", ctype)
+                for k, v in extra.items():
+                    self.send_header(k, v)
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
@@ -518,6 +529,102 @@ check(
     and state14.by_name["a"].consecutive_failures == 4,
 )
 
+# retry-after parsing
+
+check("retry-after seconds", upstream_mod.parse_retry_after("5") == 5.0)
+check("retry-after float seconds", upstream_mod.parse_retry_after("2.5") == 2.5)
+check("retry-after capped at 60", upstream_mod.parse_retry_after("120") == 60.0)
+check("retry-after zero", upstream_mod.parse_retry_after("0") == 0.0)
+check("retry-after garbage ignored", upstream_mod.parse_retry_after("garbage") is None)
+check("retry-after empty ignored", upstream_mod.parse_retry_after("") is None)
+check("retry-after negative ignored", upstream_mod.parse_retry_after("-3") is None)
+check("retry-after none ignored", upstream_mod.parse_retry_after(None) is None)
+check("retry-after inf ignored", upstream_mod.parse_retry_after("inf") is None)
+check("retry-after int value", upstream_mod.parse_retry_after(10) == 10.0)
+now_dt = datetime.datetime(2026, 11, 23, 12, 0, 0, tzinfo=datetime.timezone.utc)
+future = email.utils.format_datetime(now_dt + datetime.timedelta(seconds=30))
+check("retry-after http-date", upstream_mod.parse_retry_after(future, now=now_dt) == 30.0)
+past = email.utils.format_datetime(now_dt - datetime.timedelta(seconds=10))
+check("retry-after past date means now", upstream_mod.parse_retry_after(past, now=now_dt) == 0.0)
+far = email.utils.format_datetime(now_dt + datetime.timedelta(hours=2))
+check("retry-after future date capped", upstream_mod.parse_retry_after(far, now=now_dt) == 60.0)
+check("retry-after bad date ignored", upstream_mod.parse_retry_after("not a date at all") is None)
+
+# retry-after state on the upstream
+
+st_ra = upstream_mod.UpstreamState({"name": "x", "base_url": "http://127.0.0.1:1/v1"})
+check("retry-after not cooling by default", not st_ra.cooling_down())
+st_ra.record_retry_after(None)
+check("retry-after none leaves it alone", not st_ra.cooling_down())
+st_ra.record_retry_after(30)
+check("retry-after cooling after record", st_ra.cooling_down())
+check("retry-after remaining positive", 0 < st_ra.retry_after_remaining() <= 30)
+check("retry-after snapshot shows seconds", st_ra.snapshot()["retry_after_s"] > 0)
+st_ra2 = upstream_mod.UpstreamState({"name": "y", "base_url": "http://127.0.0.1:1/v1"})
+st_ra2.record_retry_after(0.05)
+time.sleep(0.12)
+check("retry-after cooldown expires", not st_ra2.cooling_down())
+
+# retry-after end to end: 429 with a header cools the upstream down
+
+def fail429_ra_then_ok(n, body, path):
+    if n == 1:
+        return 429, b"slow down", "text/plain", {"Retry-After": "60"}
+    return ok_chat(n, body, path)
+
+up_ra1 = FakeUpstream(fail429_ra_then_ok)
+up_ra2 = FakeUpstream(ok_chat)
+cfgr = make_cfg(
+    [up_spec("a", up_ra1.port), up_spec("b", up_ra2.port)],
+    routes=[{"match": "*", "try": ["a", "b"]}],
+)
+srvr, portr, stater, _ = start_relay(cfgr, auth_enabled=False)
+status, headers, _ = http_request(portr, "POST", "/v1/chat/completions", {"model": "m", "messages": []})
+check("retry-after 429 falls back", status == 200 and headers.get("x-relay-upstream") == "b")
+check("retry-after upstream cooling", stater.by_name["a"].cooling_down())
+status, headers, _ = http_request(portr, "POST", "/v1/chat/completions", {"model": "m", "messages": []})
+check(
+    "retry-after cooling upstream skipped",
+    status == 200 and headers.get("x-relay-upstream") == "b" and len(up_ra1.requests) == 1,
+)
+status, _, data = http_request(portr, "GET", "/relay/status")
+ups = {u["name"]: u for u in json.loads(data)["upstreams"]}
+check("status retry-after visible", ups["a"]["retry_after_s"] > 0)
+
+# retry-after: all cooling still gets tried rather than failing outright
+
+def always429_ra(n, body, path):
+    return 429, b"slow down", "text/plain", {"Retry-After": "60"}
+
+up_ra3 = FakeUpstream(always429_ra)
+cfgs = make_cfg([up_spec("a", up_ra3.port)], routes=[{"match": "*", "try": ["a"]}])
+srvs, ports, _, _ = start_relay(cfgs, auth_enabled=False)
+http_request(ports, "POST", "/v1/chat/completions", {"model": "m", "messages": []})
+status, _, _ = http_request(ports, "POST", "/v1/chat/completions", {"model": "m", "messages": []})
+check("retry-after all cooling still tried", status == 502 and len(up_ra3.requests) == 2)
+
+# retry-after: garbage header is ignored, upstream gets retried
+
+def fail429_garbage_then_ok(n, body, path):
+    if n == 1:
+        return 429, b"slow down", "text/plain", {"Retry-After": "garbage"}
+    return ok_chat(n, body, path)
+
+up_ra4 = FakeUpstream(fail429_garbage_then_ok)
+up_ra5 = FakeUpstream(ok_chat)
+cfgt = make_cfg(
+    [up_spec("a", up_ra4.port), up_spec("b", up_ra5.port)],
+    routes=[{"match": "*", "try": ["a", "b"]}],
+)
+srvt, portt, statet, _ = start_relay(cfgt, auth_enabled=False)
+http_request(portt, "POST", "/v1/chat/completions", {"model": "m", "messages": []})
+check("retry-after garbage not cooling", not statet.by_name["a"].cooling_down())
+status, headers, _ = http_request(portt, "POST", "/v1/chat/completions", {"model": "m", "messages": []})
+check(
+    "retry-after garbage upstream retried",
+    status == 200 and headers.get("x-relay-upstream") == "a" and len(up_ra4.requests) == 2,
+)
+
 # status shows breaker and latency
 
 status, _, data = http_request(port12, "GET", "/relay/status")
@@ -591,7 +698,7 @@ status, _, data = http_request(port15, "GET", "/relay/status")
 obj = json.loads(data)
 check(
     "status shape",
-    obj["version"] == "0.2.0"
+    obj["version"] == "0.3.0"
     and "uptime_s" in obj
     and isinstance(obj["upstreams"], list)
     and isinstance(obj["keys_today"], list),
@@ -662,7 +769,7 @@ check("no auth header without api_key_env", "authorization" not in up_k.requests
 out = subprocess.run(
     [sys.executable, "relay.py", "--version"], capture_output=True, text=True, cwd=os.path.dirname(os.path.abspath(__file__))
 )
-check("cli version", out.stdout.strip() == "relay 0.2.0")
+check("cli version", out.stdout.strip() == "relay 0.3.0")
 
 # weighted routing end to end: weights 3 and 1 split traffic 6 to 2
 
@@ -709,7 +816,8 @@ for s_ in _servers:
     except Exception:
         pass
 for u in (up_a, up_b1, up_b2, up_c1, up_c2, up_d2, up_e, up_e2, up_s, up_s2, up_emb,
-          up_m1, up_m2, up_f1, up_f2, up_g, up_h, up_cap, up_r1, up_r2, up_chk, up_k):
+          up_m1, up_m2, up_f1, up_f2, up_g, up_h, up_cap, up_r1, up_r2, up_chk, up_k,
+          up_ra1, up_ra2, up_ra3, up_ra4, up_ra5):
     try:
         u.close()
     except Exception:
