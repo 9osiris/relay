@@ -95,6 +95,15 @@ failure re-opens it. If every upstream is tripped, relay still tries
 them rather than failing outright. `/relay/status` shows per-upstream
 breaker state, rolling average latency, and request/error counts.
 
+When a 429 carries a `Retry-After` header, relay remembers it per
+upstream and skips that upstream until the window passes, capped at 60
+seconds. Both forms count: delay-seconds (`Retry-After: 5`) and an
+http-date (`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`). A garbage
+value is ignored and the upstream is retried as normal, and if every
+upstream is cooling down relay still tries them rather than failing
+outright. `/relay/status` shows the remaining cooldown per upstream
+as `retry_after_s`.
+
 ## keys and budgets
 
 By default clients must authenticate with a relay-issued key:
@@ -155,11 +164,12 @@ The server always binds 127.0.0.1.
 - `keys.py` - key issuance/verification, daily spend caps
 - `log.py` - JSONL request log with rotation
 - `dashboard.py` - the dashboard HTML
-- `test_relay.py` - 96 checks, run with `python3 test_relay.py`
+- `test_relay.py` - 123 checks, run with `python3 test_relay.py`
 
 Tests run entirely against fake upstream servers on 127.0.0.1: route
-matching, fallback on 500/429/connection-refused, streaming byte
-passthrough with usage capture, breaker trip and half-open recovery,
-key auth and hashed storage, daily-cap 402s, pricing math, log schema
-and rotation, model aggregation, config validation, and admin reload.
+matching, fallback on 500/429/connection-refused, retry-after cooldowns,
+streaming byte passthrough with usage capture, breaker trip and
+half-open recovery, key auth and hashed storage, daily-cap 402s,
+pricing math, log schema and rotation, model aggregation, config
+validation, and admin reload.
 No real API keys, no external network.
