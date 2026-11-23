@@ -9,7 +9,7 @@ import config as config_mod
 import keys
 import proxy
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 
 def cmd_serve(args):
