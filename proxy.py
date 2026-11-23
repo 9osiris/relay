@@ -15,7 +15,7 @@ import router
 import upstream as upstream_mod
 from dashboard import DASHBOARD_HTML
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 RETRYABLE_STATUSES = (429, 500, 502, 503, 504)
 
 
@@ -278,9 +278,12 @@ def make_handler(state, logger):
             if not ordered:
                 self._api_error(400, "no route for model '%s'" % model)
                 return
-            # skip tripped breakers unless every upstream is tripped
+            # skip tripped breakers and cooling-down upstreams unless
+            # every upstream is tripped or cooling down
             now = time.monotonic()
-            candidates = [u for u in ordered if u.breaker_allows(now)] or ordered
+            candidates = [
+                u for u in ordered if u.breaker_allows(now) and not u.cooling_down(now)
+            ] or ordered
             candidates = state.order_candidates(candidates)
             stream = kind == "chat" and bool(body.get("stream"))
             started = time.monotonic()
@@ -297,6 +300,11 @@ def make_handler(state, logger):
                     _backoff()
                     continue
                 if status in RETRYABLE_STATUSES:
+                    if status == 429:
+                        # remember the upstream's ask and skip it until then
+                        up.record_retry_after(
+                            upstream_mod.parse_retry_after(rheaders.get("retry-after"))
+                        )
                     try:
                         http_resp.read()
                     finally:
