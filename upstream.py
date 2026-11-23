@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # relay upstream: per-upstream state, circuit breaker, raw http forwarding.
 
+import datetime
+import email.utils
 import http.client
 import os
 import threading
@@ -10,6 +12,42 @@ import urllib.parse
 FAILURES_TO_TRIP = 3
 HALF_OPEN_AFTER_S = 30.0
 LATENCY_WINDOW = 50
+RETRY_AFTER_MAX_S = 60.0
+
+
+def parse_retry_after(value, now=None):
+    # retry-after header value -> seconds to wait, capped at 60.
+    # takes delay-seconds ("5") or an http-date; garbage returns None.
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+        if seconds != seconds or seconds in (float("inf"), float("-inf")) or seconds < 0:
+            return None
+        return min(seconds, RETRY_AFTER_MAX_S)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        seconds = float(text)
+        if seconds != seconds or seconds in (float("inf"), float("-inf")) or seconds < 0:
+            return None
+        return min(seconds, RETRY_AFTER_MAX_S)
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    ref = now if now is not None else datetime.datetime.now(datetime.timezone.utc)
+    seconds = (when - ref).total_seconds()
+    if seconds <= 0:
+        return 0.0
+    return min(seconds, RETRY_AFTER_MAX_S)
 
 
 class UpstreamError(Exception):
@@ -35,6 +73,7 @@ class UpstreamState:
         self.latencies = []
         self.breaker_open = False
         self.breaker_opened_at = 0.0
+        self.retry_after_until = 0.0
 
     def api_key(self):
         # resolved per request so env changes apply without restart
@@ -58,6 +97,24 @@ class UpstreamState:
             if now - self.breaker_opened_at >= self.half_open_after:
                 return "half-open"
             return "open"
+
+    def record_retry_after(self, seconds):
+        # seconds comes from parse_retry_after; None means no usable header
+        if seconds is None:
+            return
+        with self.lock:
+            self.retry_after_until = max(self.retry_after_until, time.monotonic() + seconds)
+
+    def cooling_down(self, now=None):
+        # true while a remembered retry-after window is still open
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            return now < self.retry_after_until
+
+    def retry_after_remaining(self, now=None):
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            return max(0.0, self.retry_after_until - now)
 
     def record_success(self, latency_ms):
         # any success closes the breaker, including half-open probes
@@ -102,6 +159,7 @@ class UpstreamState:
                 "weight": self.weight,
                 "models": list(self.models),
                 "breaker": self.breaker_state(),
+                "retry_after_s": round(self.retry_after_remaining(), 1),
                 "consecutive_failures": self.consecutive_failures,
                 "avg_latency_ms": round(sum(lat) / len(lat), 1) if lat else 0.0,
                 "requests": self.total_requests,
